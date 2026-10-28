@@ -77,7 +77,12 @@ class LeadsScanner(object):
         from urllib.parse import urlparse
         host = urlparse(url).netloc
         if host not in self._robots:
-            self._robots[host] = Robots(url, fetcher=self.fetch)
+            r = Robots(url, fetcher=self.fetch)
+            # honor robots Crawl-delay (raise-only), same contract as crawler
+            delay = r.crawl_delay()
+            if delay:
+                self.throttle.set_crawl_delay(host, delay)
+            self._robots[host] = r
         ok, reason = self._robots[host].allowed(url)
         return ok, reason
 
@@ -87,8 +92,9 @@ class LeadsScanner(object):
         if not ok:
             return [], reason
         from urllib.parse import urlparse
+        host = urlparse(feed_url).netloc
         try:
-            self.throttle.wait_for(urlparse(feed_url).netloc)
+            self.throttle.wait_for(host)
         except RuntimeError as e:
             return [], "budget:" + str(e)
         try:
@@ -96,6 +102,9 @@ class LeadsScanner(object):
         except transport.TransportError:
             return [], "network-error"
         if resp.status != 200:
+            if transport.status_class(resp.status) in ("forbidden", "pressure"):
+                # block/429 on the feed itself: cool the host down, no evasion
+                self.throttle.record_block(host)
             return [], "http-%d" % resp.status
         text = resp.body.decode("utf-8", "replace")
         leads = []

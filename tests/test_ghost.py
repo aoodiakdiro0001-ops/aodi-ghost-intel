@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -48,23 +49,55 @@ class TransportTests(unittest.TestCase):
         self.assertIn("mailto:baranavisat@gmail.com", transport.UA)
 
     def test_ua_not_overridable(self):
-        # a caller can't make the tool impersonate a browser
-        def fake_open(*a, **k):
-            raise AssertionError("should not reach network")
+        # REAL test: call transport.fetch with a spoofing UA and assert the
+        # guard raises BEFORE any network is touched (no tautology).
+        def _no_net(*a, **k):
+            raise AssertionError("no network may be attempted")
         import urllib.request
         orig = urllib.request.build_opener
-        urllib.request.build_opener = lambda *a, **k: (_ for _ in ()).throw(
-            AssertionError("no net"))
+        urllib.request.build_opener = _no_net
         try:
             with self.assertRaises(ValueError):
-                # build a request path that would trigger UA check
-                # emulate by calling the guard directly
-                h = {"User-Agent": "Mozilla/5.0"}
-                for k in h:
-                    if k.lower() == "user-agent":
-                        raise ValueError("User-Agent is not overridable in this build")
+                transport.fetch("https://example.com/",
+                                headers={"User-Agent": "Mozilla/5.0"})
         finally:
             urllib.request.build_opener = orig
+
+    def test_scheme_allowlist_rejects_non_http(self):
+        # PUBLIC web pages only: file://, ftp:// etc must be refused
+        for bad in ("file:///etc/passwd", "ftp://host/x",
+                    "data:text/html,hi", "javascript:alert(1)"):
+            with self.assertRaises(ValueError):
+                transport.fetch(bad)
+        self.assertEqual(transport.check_scheme("https://ok.example/"), "https://ok.example/")
+
+    def test_cross_host_and_downgrade_redirects_blocked(self):
+        # the redirect handler must refuse to leave the checked host or to
+        # downgrade https->http (both would bypass robots/throttle of a new host)
+        h = transport._SameHostRedirectHandler()
+
+        def _blocked(newurl):
+            try:
+                h.redirect_request(urllib.request.Request("https://a.example/page"),
+                                   None, 302, "Found", {}, newurl)
+            except urllib.error.HTTPError as e:
+                return "blocked" in str(e.reason)
+            return False
+
+        self.assertTrue(_blocked("https://b.example/x"))       # cross-host
+        self.assertTrue(_blocked("http://a.example/x"))        # https->http
+        self.assertTrue(_blocked("file:///etc/passwd"))        # non-http scheme
+        # same-host https->https is allowed: no "blocked" HTTPError is raised
+        # (it reaches the default handler, which only fails on the fake fp)
+        try:
+            h.redirect_request(urllib.request.Request("https://a.example/page"),
+                               None, 302, "Found", {}, "https://a.example/other")
+            allowed = True
+        except urllib.error.HTTPError as e:
+            allowed = "blocked" not in str(e.reason)
+        except AttributeError:
+            allowed = True          # reached super() -> our guard passed
+        self.assertTrue(allowed)
 
     def test_status_class_buckets(self):
         self.assertEqual(transport.status_class(200), "ok")
@@ -143,11 +176,23 @@ class ThrottleTests(unittest.TestCase):
             th.wait_for("h", max_per_host=3)
 
     def test_record_block_cools_down(self):
-        th = throttle.Throttle(min_interval_s=0.0, now=lambda: 0.0)
-        th.record_block("h")
-        # next wait_for would need to sleep a long time; we just assert the
-        # last timestamp was pushed into the future (no rotation occurred)
-        self.assertGreater(th._last["h"], 0.0)
+        # REAL test: after a block, the NEXT visit is SKIPPED (RuntimeError),
+        # not slept out for ~1h, and no identity change happens.
+        clock = {"t": 1000.0}
+        slept = []
+        import time as _t
+        orig = _t.sleep
+        _t.sleep = lambda s: slept.append(s)
+        try:
+            th = throttle.Throttle(min_interval_s=0.0, now=lambda: clock["t"])
+            th.wait_for("h")                       # a normal request
+            th.record_block("h")                   # a 403/429 arrives
+            self.assertGreater(th._last["h"], clock["t"])   # clock in future
+            with self.assertRaises(RuntimeError):   # SKIP, don't sleep ~1h
+                th.wait_for("h")
+            self.assertEqual(slept, [])             # nothing was ever slept
+        finally:
+            _t.sleep = orig
 
 
 # -------------------------------------------------------------------- extract
@@ -158,6 +203,16 @@ class ExtractTests(unittest.TestCase):
         self.assertNotIn("var x", t)
         self.assertIn("Hi", t)
         self.assertIn("$50", t)
+
+    def test_html_to_text_survives_unclosed_script(self):
+        # ReDoS guard: many unclosed <script> tags must NOT stall the regex.
+        # (pre-fix this was quadratic; now we pre-check for a closing tag)
+        hostile = "<script>" * 2000 + "text"
+        import time as _tm
+        t0 = _tm.perf_counter()
+        out = extract.html_to_text(hostile)
+        self.assertLess(_tm.perf_counter() - t0, 2.0)   # fast, not minutes
+        self.assertIn("text", out)
 
     def test_extract_prices_variants(self):
         for s, expect in [("$99", 99.0), ("€1,299.00", 1299.0),
@@ -213,6 +268,16 @@ class StorageTests(unittest.TestCase):
     def test_remote_dsn_rejected(self):
         with self.assertRaises(ValueError):
             storage.Storage("postgres://user:pw@host/db")
+
+    def test_snapshot_text_is_capped(self):
+        # unbounded text would grow ~hundreds of MB/target/year; cap enforced
+        s = storage.Storage(_tmp())
+        tid = s.add_target("A", "https://a.example")
+        huge = "x" * (storage.Storage.MAX_STORED_TEXT + 5000)
+        s.add_snapshot(tid, 200, "ok", "h", [10], len(huge), huge)
+        got = s.latest_snapshot(tid)["text"]
+        self.assertEqual(len(got), storage.Storage.MAX_STORED_TEXT)
+        s.close()
 
     def test_changes_roundtrip(self):
         s = storage.Storage(_tmp())
@@ -271,7 +336,8 @@ class CrawlerTests(unittest.TestCase):
 
     def test_forbidden_page_cools_host_no_rotation(self):
         s, tid = self._store_with_target()
-        th = throttle.Throttle(0.0)
+        clock = {"t": 5000.0}
+        th = throttle.Throttle(0.0, now=lambda: clock["t"])
         robots = FakeResp("https://acme.example/robots.txt", 404, b"")
         page = FakeResp("https://acme.example/pricing", 403, b"")
         c = crawler.Crawler(s, fetcher=make_fetcher({"robots.txt": robots,
@@ -279,8 +345,42 @@ class CrawlerTests(unittest.TestCase):
                             throttle=th)
         r = c.run()
         self.assertEqual(r[0].status_class, "forbidden")
-        # the host was cooled down (block => stop, never rotate)
-        self.assertGreater(th._last["acme.example"], 0.0)
+        # the host's next-allowed time is pushed into the FUTURE (cool-down),
+        # proving record_block ran against a known clock (not a tautology)
+        self.assertGreater(th._last["acme.example"], clock["t"])
+        # a second target on the SAME host is now SKIPPED (block => stop),
+        # not slept for ~1h and never rotated
+        c2 = crawler.Crawler(s, fetcher=make_fetcher({"robots.txt": robots,
+                                                      "pricing": page}),
+                             throttle=th)
+        r2 = c2.run()
+        self.assertIn("cooling down", r2[0].skipped)
+        s.close()
+
+    def test_status_transition_recorded_as_change(self):
+        # 200 -> 403 is the most operationally important event: it must be an
+        # explicit change row, surfaced to the digest.
+        s, tid = self._store_with_target()
+        robots = FakeResp("https://acme.example/robots.txt", 404, b"")
+        page_ok = FakeResp("https://acme.example/pricing", 200,
+                           b"<html><p>Plan A $50</p></html>")
+        page_block = FakeResp("https://acme.example/pricing", 403, b"")
+        c1 = crawler.Crawler(s, summarizer=StubSummarizer(),
+                             fetcher=make_fetcher({"robots.txt": robots,
+                                                   "pricing": page_ok}),
+                             throttle=throttle.Throttle(0.0))
+        c1.run()
+        clock = {"t": 100.0}
+        th = throttle.Throttle(0.0, now=lambda: clock["t"])
+        c2 = crawler.Crawler(s, summarizer=StubSummarizer(),
+                             fetcher=make_fetcher({"robots.txt": robots,
+                                                   "pricing": page_block}),
+                             throttle=th)
+        r2 = c2.run()
+        self.assertTrue(r2[0].changed)
+        self.assertIn("status changed", r2[0].summary)
+        kinds = [c["kind"] for c in s.recent_changes()]
+        self.assertIn("status", kinds)
         s.close()
 
     def test_summary_stub_deterministic(self):
@@ -336,6 +436,22 @@ class DigestTests(unittest.TestCase):
         os.environ.pop("TELEGRAM_TOKEN", None)
         res = alerts.send("hello")
         self.assertFalse(res["ok"])
+
+    def test_telegram_opener_refuses_ambient_proxies(self):
+        # the bot token must never ride an OS-configured proxy. Passing an
+        # explicit empty ProxyHandler({}) makes build_opener DROP the ambient
+        # env-proxy handler entirely -> no ProxyHandler in the chain at all.
+        import urllib.request
+        ambient = [h for h in alerts._OPENER.handlers
+                   if isinstance(h, urllib.request.ProxyHandler)
+                   and getattr(h, "proxies", {})]
+        self.assertEqual(ambient, [])          # no ambient-proxy handler exists
+        # and a reference default opener WOULD have picked one up (proof the
+        # guard is doing real work, not vacuously true)
+        ref = urllib.request.build_opener()
+        self.assertTrue(any(isinstance(h, urllib.request.ProxyHandler)
+                            and getattr(h, "proxies", {})
+                            for h in ref.handlers))
 
 
 # ------------------------------------------------------------------- dashboard

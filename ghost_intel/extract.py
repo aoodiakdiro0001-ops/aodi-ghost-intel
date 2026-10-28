@@ -18,6 +18,10 @@ _PRICE_RE = re.compile(
     r"|(?P<num2>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s?(?P<post>[$€£₹₺]|USD|EUR|GBP|TRY)"
 )
 _SCRIPT_RE = re.compile(r"<(script|style|noscript)[^>]*>.*?</\1>", re.I | re.S)
+# ReDoS guard: an unclosed <script>/<style> tag makes the backreference regex
+# scan to EOF for every start position (quadratic blowup on a 2 MiB page). We
+# only apply the regex when a matching close tag is actually present.
+_SCRIPT_TAGS = ("script", "style", "noscript")
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _WORD_RE = re.compile(r"[a-zA-Z0-9\u0600-\u06FF]{2,}")
@@ -29,8 +33,13 @@ def html_to_text(html):
         return ""
     if isinstance(html, bytes):
         html = html.decode("utf-8", "replace")
-    t = _SCRIPT_RE.sub(" ", html)
-    t = _TAG_RE.sub(" ", t)
+    low = html.lower()
+    for tag in _SCRIPT_TAGS:
+        # only strip when BOTH an open and a close tag exist (avoids ReDoS)
+        if "<" + tag in low and "</" + tag in low:
+            html = re.sub(r"<%s[^>]*>.*?</%s>" % (tag, tag), " ", html,
+                          flags=re.I | re.S)
+    t = _TAG_RE.sub(" ", html)
     t = _WS_RE.sub(" ", t).strip()
     return t
 

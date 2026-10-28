@@ -77,11 +77,21 @@ class Crawler(object):
         except RuntimeError as e:
             return CrawlResult(url, name, skipped="budget:" + str(e))
 
+        prev = self.store.latest_snapshot(tgt["id"]) if tgt.get("id") else None
+
         try:
             resp = self.fetch(url)
         except transport.TransportError as e:
+            # network-level failure (DNS/timeout/refused): record, don't crash.
+            # No rotation, no retry-with-different-identity — ever.
+            if prev and prev.get("status") == 200:
+                # a previously-live target just went unreachable: that IS a change
+                self.store.add_change(tgt["id"], "status",
+                                      {"old_status": prev.get("status"),
+                                       "new_status": None,
+                                       "new_status_class": "network-error"})
             return CrawlResult(url, name, status_class="network-error",
-                               summary="network error: %s" % transport.status_class(0))
+                               summary="network error: %s" % e)
 
         sclass = transport.status_class(resp.status)
         if sclass in ("forbidden", "pressure"):
@@ -92,10 +102,19 @@ class Crawler(object):
         prices = extract.extract_prices(text)
         chash = extract.content_hash(text) if resp.status == 200 else ""
 
-        prev = self.store.latest_snapshot(tgt["id"]) if tgt.get("id") else None
         changed = False
         summary = ""
         detail = {}
+
+        if resp.status != 200 and prev and prev.get("status") == 200:
+            # status transition (e.g. 200 -> 403/500): the most operationally
+            # important event — record it as an explicit change.
+            changed = True
+            detail = {"kind": "status", "old_status": prev.get("status"),
+                      "new_status": resp.status, "new_status_class": sclass}
+            self.store.add_change(tgt["id"], "status", detail)
+            if self.summarizer:
+                summary = self.summarizer.summarize(name, detail)
 
         if resp.status == 200 and prev and prev.get("content_hash"):
             diff = extract.diff_summary(prev.get("text", ""), text)

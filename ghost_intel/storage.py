@@ -100,9 +100,16 @@ class Storage(object):
                  "keywords": r[4]} for r in rows]
 
     # --------------------------------------------------------- snapshots
+    # Cap the stored readable text: unbounded text would grow ~hundreds of MB
+    # per target per year on a cron, and it's only needed for diffing the most
+    # recent couple of versions (finding: resource exhaustion).
+    MAX_STORED_TEXT = 200 * 1024         # 200 KB of extracted text per snapshot
+
     def add_snapshot(self, target_id, status, status_class, content_hash,
                      prices, text_len, text="", note=""):
         import json as _json
+        if text and len(text) > self.MAX_STORED_TEXT:
+            text = text[:self.MAX_STORED_TEXT]
         self.conn.execute(
             "INSERT INTO snapshots (target_id, ts, status, status_class, "
             "content_hash, prices, text_len, text, note) VALUES (?,?,?,?,?,?,?,?,?)",

@@ -49,12 +49,54 @@ class Response(object):
         self.elapsed_ms = elapsed_ms
 
 
+ALLOWED_SCHEMES = ("http", "https")   # PUBLIC web pages only — no file://, no ftp://
+
+
+def check_scheme(url):
+    """Reject anything that isn't a PUBLIC web page (finding: scheme allowlist).
+
+    Enforces the 'public pages only' bright line at the lowest layer, so a
+    `file://`, `ftp://`, or other scheme can never reach the network stack
+    (which would otherwise allow reading local files into the store).
+    """
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme not in ALLOWED_SCHEMES:
+        raise ValueError("only public http/https URLs are allowed, got %r" % (url,))
+    return url
+
+
+class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse cross-host and https->http redirects (defense in depth).
+
+    A robots-checked, throttled target must not be able to bounce the truthful
+    UA fetch to a DIFFERENT host whose robots.txt was never consulted and whose
+    throttle bucket is never used. Same-host, http/https-preserving redirects
+    are followed; anything else is stopped.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = urllib.parse.urlparse(newurl)
+        old = urllib.parse.urlparse(req.full_url)
+        if new.scheme.lower() not in ALLOWED_SCHEMES:
+            raise urllib.error.HTTPError(newurl, code, "redirect to non-http scheme blocked", headers, fp)
+        if new.netloc.lower() != old.netloc.lower():
+            raise urllib.error.HTTPError(newurl, code, "cross-host redirect blocked", headers, fp)
+        if old.scheme.lower() == "https" and new.scheme.lower() == "http":
+            raise urllib.error.HTTPError(newurl, code, "https->http downgrade blocked", headers, fp)
+        return super(_SameHostRedirectHandler, self).redirect_request(
+            req, fp, code, msg, headers, newurl)
+
+
 def fetch(url, method="GET", timeout=25.0, headers=None, data=None):
     """Always returns a Response; raises TransportError on network failure.
 
     HTTP error codes (403/404/429/500...) are returned as Response objects so
     the crawler can record them as observations instead of crashing.
+
+    Enforces the bright lines: truthful non-overridable UA, scheme allowlist
+    (http/https only), no ambient proxies, and same-host-only redirects.
     """
+    check_scheme(url)                                   # PUBLIC web pages only
     h = dict(BASE_HEADERS)
     if headers:
         for k, v in headers.items():
@@ -62,8 +104,10 @@ def fetch(url, method="GET", timeout=25.0, headers=None, data=None):
                 # refuse impersonation: the tool must stay identifiable
                 raise ValueError("User-Agent is not overridable in this build")
             h[k] = v
-    # refuse ambient system proxies so the receipt reflects the real network path
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # refuse ambient system proxies so the receipt reflects the real network
+    # path, and constrain redirects so they can't hop to an unchecked host.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _SameHostRedirectHandler())
     req = urllib.request.Request(url, data=data, headers=h, method=method)
     t0 = time.perf_counter()
     try:

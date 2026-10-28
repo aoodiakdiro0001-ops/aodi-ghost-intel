@@ -22,14 +22,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ghost_intel import alerts, crawler, dashboard, leads, storage  # noqa: E402
 from ghost_intel.llm import get_summarizer  # noqa: E402
+from ghost_intel.transport import check_scheme  # noqa: E402
 
 
 def cmd_init(args):
     store = storage.Storage(args.db)
     n = 0
+    skipped = 0
     if args.sample and os.path.exists(args.sample):
         data = json.load(open(args.sample))
         for t in data.get("targets", []):
+            try:
+                check_scheme(t["url"])           # PUBLIC http/https only
+            except ValueError as e:
+                print("  skip %s: %s" % (t.get("name", "?"), e))
+                skipped += 1
+                continue
             store.add_target(t["name"], t["url"], t.get("kind", "page"),
                              ",".join(t.get("keywords", [])))
             n += 1
@@ -40,10 +48,13 @@ def cmd_init(args):
              counts["targets"], counts["snapshots"]))
     if n:
         print("loaded %d sample target(s)" % n)
+    if skipped:
+        print("skipped %d non-http(s) target(s)" % skipped)
     return 0
 
 
 def cmd_add(args):
+    check_scheme(args.url)                       # PUBLIC http/https only
     store = storage.Storage(args.db)
     store.add_target(args.name, args.url, args.kind, args.keywords)
     store.close()
