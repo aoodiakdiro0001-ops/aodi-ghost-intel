@@ -438,20 +438,24 @@ class DigestTests(unittest.TestCase):
         self.assertFalse(res["ok"])
 
     def test_telegram_opener_refuses_ambient_proxies(self):
-        # the bot token must never ride an OS-configured proxy. Passing an
-        # explicit empty ProxyHandler({}) makes build_opener DROP the ambient
-        # env-proxy handler entirely -> no ProxyHandler in the chain at all.
+        # the bot token must never ride an OS-configured proxy. We set an
+        # ambient proxy env var, prove a default opener WOULD honor it, then
+        # prove the alerts opener does NOT (deterministic on any host).
         import urllib.request
-        ambient = [h for h in alerts._OPENER.handlers
-                   if isinstance(h, urllib.request.ProxyHandler)
-                   and getattr(h, "proxies", {})]
-        self.assertEqual(ambient, [])          # no ambient-proxy handler exists
-        # and a reference default opener WOULD have picked one up (proof the
-        # guard is doing real work, not vacuously true)
-        ref = urllib.request.build_opener()
-        self.assertTrue(any(isinstance(h, urllib.request.ProxyHandler)
-                            and getattr(h, "proxies", {})
-                            for h in ref.handlers))
+        os.environ["HTTPS_PROXY"] = "http://proxy.invalid:8080"
+        try:
+            ref = urllib.request.build_opener()      # honors ambient proxy
+            self.assertTrue(any(
+                isinstance(h, urllib.request.ProxyHandler) and
+                getattr(h, "proxies", {})
+                for h in ref.handlers))
+            # the Telegram opener must carry NO ambient-proxy handler at all
+            ambient = [h for h in alerts._OPENER.handlers
+                       if isinstance(h, urllib.request.ProxyHandler)
+                       and getattr(h, "proxies", {})]
+            self.assertEqual(ambient, [])
+        finally:
+            os.environ.pop("HTTPS_PROXY", None)
 
 
 # ------------------------------------------------------------------- dashboard
