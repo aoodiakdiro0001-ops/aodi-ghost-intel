@@ -1,0 +1,23 @@
+# memory & secrets — never commit
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.env.*
+secrets/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# node / wrangler
+node_modules/
+.wrangler/
+dist/
+
+# os
+.DS_Store

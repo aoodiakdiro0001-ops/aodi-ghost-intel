@@ -1,0 +1,79 @@
+# Ghost-Intel Actions — the free "server" that runs the radar.
+#
+# Two triggers:
+#   schedule:  every 4 hours — crawl targets, rebuild the dashboard, send a
+#              digest if anything changed.
+#   workflow_dispatch: on-demand run from the Actions tab.
+#
+# Free-tier math: public repos get UNLIMITED Actions minutes. A ~30s run every
+# 4h = ~180 runs ≈ 90 min/month — comfortably free.
+#
+# SECRETS (Settings -> Secrets -> Actions), all optional unless noted:
+#   TELEGRAM_TOKEN    bot token from @BotFather (to send digests)
+#   TELEGRAM_CHAT_ID  your chat id
+#   GHOST_AI          stub | groq | ollama   (default: stub)
+#   GROQ_API_KEY      only if GHOST_AI=groq (free-tier inference)
+#
+# Targets live in examples/targets.json (commit your own list). The store is
+# committed back so history persists; keep the repo PRIVATE if your target list
+# or stored text is sensitive (the SQLite file contains extracted page text).
+
+name: ghost-intel
+
+on:
+  schedule:
+    - cron: "23 */4 * * *"   # every 4h at :23 (off the top-of-hour stampede)
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to commit the store + dashboard back
+
+# single-writer lock: two overlapping runs must not race on the same store
+concurrency:
+  group: ghost-intel
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # env via mapping (NOT shell interpolation) so a secret with $/quotes/newlines
+    # can never execute as shell.
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GHOST_AI: ${{ secrets.GHOST_AI || 'stub' }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GHOST_DB: ghost-intel.db
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Init store (+ committed targets)
+        run: |
+          python -m ghost_intel.cli init --sample examples/targets.json || true
+
+      - name: Crawl targets politely
+        run: python -m ghost_intel.cli scan
+
+      - name: Rebuild dashboard
+        run: python -m ghost_intel.cli dashboard --out docs/index.html
+
+      - name: Doctor
+        run: python -m ghost_intel.cli doctor || true
+
+      - name: Send digest (if a token is configured)
+        if: env.TELEGRAM_TOKEN != ''
+        run: python -m ghost_intel.cli digest --send
+
+      - name: Persist store + dashboard
+        if: success()
+        run: |
+          git config user.name "ghost-intel-bot"
+          git config user.email "ghost-intel@users.noreply.github.com"
+          git add -f ghost-intel.db docs/index.html || true
+          git commit -m "ghost: update $(date -u +%FT%TZ)" || true
+          git pull --rebase --autostash || { echo "::error::push race"; exit 1; }
+          git push || { echo "::error::push failed"; exit 1; }

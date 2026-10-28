@@ -1,0 +1,17 @@
+{
+  "_note": "Sample targets — replace with YOUR own public pages. Only monitor what you're entitled to see (public, non-authenticated, robots-allowed). See SECURITY.md.",
+  "targets": [
+    {
+      "name": "ExampleCo Pricing",
+      "url": "https://example.com/pricing",
+      "kind": "price",
+      "keywords": ["price", "plan", "enterprise"]
+    },
+    {
+      "name": "ExampleCo Changelog",
+      "url": "https://example.com/changelog",
+      "kind": "page",
+      "keywords": ["released", "new feature", "deprecated"]
+    }
+  ]
+}
