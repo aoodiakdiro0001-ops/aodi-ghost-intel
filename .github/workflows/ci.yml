@@ -10,7 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.8", "3.10", "3.12"]
+        # The engine is stdlib-only and compatible down to 3.8 (verified on
+        # 3.8.10 locally). The matrix uses versions installable on the runner;
+        # add "3.8" back only if your self-hosted runner provides it.
+        python-version: ["3.9", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
