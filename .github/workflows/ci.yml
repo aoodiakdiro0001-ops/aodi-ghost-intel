@@ -11,9 +11,10 @@ jobs:
     strategy:
       matrix:
         # The engine is stdlib-only and compatible down to 3.8 (verified on
-        # 3.8.10 locally). The matrix uses versions installable on the runner;
-        # add "3.8" back only if your self-hosted runner provides it.
-        python-version: ["3.9", "3.11", "3.12", "3.13"]
+        # 3.8.10 locally). ubuntu-latest (26.04) provisions 3.10-3.15, so the
+        # matrix targets those; add "3.8"/"3.9" back on a self-hosted runner
+        # if you need to pin the oldest supported interpreter.
+        python-version: ["3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
